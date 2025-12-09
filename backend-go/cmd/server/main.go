@@ -23,10 +23,10 @@ func main() {
 	qgService := service.NewQuestionGenerator(llmService)
 	csvService := analysis.NewCSVService()
 	simService := service.NewSimilarityService(ctxService)
+	exportService := service.NewExportService()
 
-	// Initialize Handler with LLM service for AI matching
-	handler := api.NewHandler(ctxService, qgService, csvService, simService, llmService)
-
+	// Initialize Handler
+	handler := api.NewHandler(ctxService, qgService, csvService, simService, exportService, llmService)
 
 	// Router Setup
 	r := chi.NewRouter()
@@ -38,7 +38,8 @@ func main() {
 
 	// CORS - Allow frontend
 	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"http://localhost:3000", "http://127.0.0.1:3000"},
+		AllowedOrigins: []string{"http://localhost:3000", "http://localhost:3001", "http://localhost:3002", "http://127.0.0.1:3000"},
+
 		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
 		AllowedHeaders:   []string{"Accept", "Authorization", "Content-Type", "X-CSRF-Token"},
 		ExposedHeaders:   []string{"Link"},

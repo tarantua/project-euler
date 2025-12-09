@@ -23,75 +23,77 @@ import (
 	"github.com/go-chi/chi/v5"
 )
 
-
-
 const (
 	UploadDir   = "./uploads"
 	MaxFileSize = 100 * 1024 * 1024 // 100MB
 )
 
 type Handler struct {
-	ContextService           *service.ContextService
-	QuestionGenerator        *service.QuestionGenerator
-	CSVService               *analysis.CSVService
-	SimilarityService        *service.SimilarityService
+	ContextService            *service.ContextService
+	QuestionGenerator         *service.QuestionGenerator
+	CSVService                *analysis.CSVService
+	SimilarityService         *service.SimilarityService
+	ExportService             *service.ExportService
 	EnhancedSimilarityService *service.EnhancedSimilarityService
-	AISemanticMatcher        *service.AISemanticMatcher
-	LLMService               *llm.Service
+	AISemanticMatcher         *service.AISemanticMatcher
+	LLMService                *llm.Service
+	CurrentDB                 service.DataSource // Active DB connection
 }
 
-func NewHandler(ctx *service.ContextService, qg *service.QuestionGenerator, csv *analysis.CSVService, sim *service.SimilarityService, llmSvc *llm.Service) *Handler {
+func NewHandler(ctx *service.ContextService, qg *service.QuestionGenerator, csv *analysis.CSVService, sim *service.SimilarityService, export *service.ExportService, llmSvc *llm.Service) *Handler {
 	return &Handler{
-		ContextService:           ctx,
-		QuestionGenerator:        qg,
-		CSVService:               csv,
-		SimilarityService:        sim,
+		ContextService:            ctx,
+		QuestionGenerator:         qg,
+		CSVService:                csv,
+		SimilarityService:         sim,
+		ExportService:             export,
 		EnhancedSimilarityService: service.NewEnhancedSimilarityService(ctx),
-		AISemanticMatcher:        service.NewAISemanticMatcher(llmSvc, ctx),
-		LLMService:               llmSvc,
+		AISemanticMatcher:         service.NewAISemanticMatcher(llmSvc, ctx),
+		LLMService:                llmSvc,
 	}
 }
 
-
-
 func (h *Handler) RegisterRoutes(r chi.Router) {
-	// Health
+	// API V2 Routes (My Migration)
 	r.Get("/health", h.HealthCheck)
+	r.Post("/api/analyze-file", h.AnalyzeFile)
+	r.Post("/api/context/{fileIndex}", h.StoreContext)
+	r.Get("/api/questions/{fileIndex}", h.GetQuestions)
+	r.Get("/api/similarity/graph", h.GetSimilarityGraph)
+	r.Post("/api/export/sql", h.ExportSQL)
+	r.Post("/api/export/python", h.ExportPython)
+	r.Get("/api/status", h.GetAnalysisStatus)
+	r.Get("/api/context/status", h.GetAnalysisContextStatus)
 
-	// File Operations
+	// DB Routes
+	r.Post("/api/db/connect", h.ConnectDB)
+	r.Get("/api/db/tables", h.ListTables)
+	r.Post("/api/db/analyze", h.AnalyzeTable)
+
+	// Upstream/Legacy Routes
 	r.Post("/upload", h.Upload)
 	r.Get("/status", h.GetStatus)
 	r.Get("/preview", h.GetPreview)
 	r.Get("/column-types", h.GetColumnTypes)
 	r.Get("/kpis", h.GetKPIs)
 
-	// Correlation & Similarity
 	r.Get("/column-similarity", h.GetColumnSimilarity)
 	r.Get("/correlation", h.GetCorrelation)
-
-	// Filter
 	r.Post("/filter", h.FilterData)
-
-	// Query (LLM-based data analysis)
 	r.Post("/query", h.Query)
 
-
-	// Context Management
 	r.Post("/context/questions", h.GenerateContextQuestions)
 	r.Post("/context/submit", h.SubmitContext)
 	r.Get("/context/{fileIndex}", h.GetContext)
 	r.Delete("/context/{fileIndex}", h.DeleteContext)
 	r.Get("/context/status", h.GetContextStatus)
 
-	// Ollama Config
 	r.Get("/config/ollama", h.GetOllamaConfig)
 	r.Post("/config/ollama", h.SaveOllamaConfig)
 
-	// Feedback Learning
 	r.Post("/feedback/match", h.SubmitMatchFeedback)
 	r.Get("/feedback/stats", h.GetFeedbackStats)
 }
-
 
 // ============================================================================
 // Health
@@ -101,9 +103,180 @@ func (h *Handler) HealthCheck(w http.ResponseWriter, r *http.Request) {
 	w.Write([]byte("OK"))
 }
 
-// ============================================================================
-// File Upload
-// ============================================================================
+// ConnectDB establishes a database connection
+func (h *Handler) ConnectDB(w http.ResponseWriter, r *http.Request) {
+	var config service.DataSourceConfig
+	if err := json.NewDecoder(r.Body).Decode(&config); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Currently only Postgres supported
+	if config.Type != "postgres" {
+		http.Error(w, "Only postgres is supported currently", http.StatusBadRequest)
+		return
+	}
+
+	ds := &service.PostgresDataSource{}
+	if err := ds.Connect(config); err != nil {
+		http.Error(w, fmt.Sprintf("Failed to connect: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Close previous if exists
+	if h.CurrentDB != nil {
+		h.CurrentDB.Close()
+	}
+	h.CurrentDB = ds
+
+	json.NewEncoder(w).Encode(map[string]string{"status": "connected"})
+}
+
+// ListTables returns tables from connected DB
+func (h *Handler) ListTables(w http.ResponseWriter, r *http.Request) {
+	if h.CurrentDB == nil {
+		http.Error(w, "No database connection", http.StatusBadRequest)
+		return
+	}
+
+	tables, err := h.CurrentDB.ListTables()
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error listing tables: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{"tables": tables})
+}
+
+// AnalyzeTable fetches data from a table and analyzes it
+func (h *Handler) AnalyzeTable(w http.ResponseWriter, r *http.Request) {
+	if h.CurrentDB == nil {
+		http.Error(w, "No database connection", http.StatusBadRequest)
+		return
+	}
+
+	var req struct {
+		TableName string `json:"table_name"`
+		FileIndex int    `json:"file_index"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	// Fetch data (preview limit 1000 rows for analysis)
+	data, err := h.CurrentDB.PreviewData(req.TableName, 1000)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error fetching data: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Analyze
+	if len(data) == 0 {
+		http.Error(w, "Table is empty", http.StatusBadRequest)
+		return
+	}
+
+	var columns []string
+	for k := range data[0] {
+		columns = append(columns, k)
+	}
+
+	analysisResult, err := h.CSVService.AnalyzeData(data, columns)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error analyzing data: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Store result
+	if req.FileIndex != 0 {
+		h.ContextService.StoreAnalysis(req.FileIndex, &analysisResult)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(analysisResult)
+}
+
+// GetAnalysisStatus returns the status of loaded files (My V2 impl)
+func (h *Handler) GetAnalysisStatus(w http.ResponseWriter, r *http.Request) {
+	analysis1 := h.ContextService.GetAnalysis(1)
+	analysis2 := h.ContextService.GetAnalysis(2)
+
+	status := map[string]interface{}{
+		"loaded":        analysis1 != nil || analysis2 != nil,
+		"file1_loaded":  analysis1 != nil,
+		"file2_loaded":  analysis2 != nil,
+		"file1_context": h.ContextService.GetContext(1) != nil,
+		"file2_context": h.ContextService.GetContext(2) != nil,
+		"file1":         analysis1,
+		"file2":         analysis2,
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// GetAnalysisContextStatus returns context status (My V2 impl)
+func (h *Handler) GetAnalysisContextStatus(w http.ResponseWriter, r *http.Request) {
+	// This structure matches Python backend likely
+	status := map[string]map[string]bool{
+		"file1": {"has_context": h.ContextService.GetContext(1) != nil},
+		"file2": {"has_context": h.ContextService.GetContext(2) != nil},
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(status)
+}
+
+// AnalyzeFile handles file upload and analysis (My V2 impl)
+func (h *Handler) AnalyzeFile(w http.ResponseWriter, r *http.Request) {
+	// Limit upload size (e.g., 10MB)
+	r.ParseMultipartForm(10 << 20)
+
+	file, header, err := r.FormFile("file")
+	if err != nil {
+		http.Error(w, "Error retrieving file", http.StatusBadRequest)
+		return
+	}
+	defer file.Close()
+
+	// Create a temp file
+	tempDir := os.TempDir()
+	tempFilePath := filepath.Join(tempDir, header.Filename)
+	tempFile, err := os.Create(tempFilePath)
+	if err != nil {
+		http.Error(w, "Error creating temp file", http.StatusInternalServerError)
+		return
+	}
+	defer os.Remove(tempFilePath) // Clean up
+	defer tempFile.Close()
+
+	if _, err := io.Copy(tempFile, file); err != nil {
+		http.Error(w, "Error saving file", http.StatusInternalServerError)
+		return
+	}
+
+	// Analyze the file
+	analysisResult, err := h.CSVService.AnalyzeFile(tempFilePath)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error analyzing file: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Store analysis result if fileIndex is provided
+	fileIndexStr := r.FormValue("fileIndex")
+	if fileIndexStr == "" {
+		fileIndexStr = r.FormValue("file_index")
+	}
+
+	if fileIndexStr != "" {
+		if fileIndex, err := strconv.Atoi(fileIndexStr); err == nil {
+			h.ContextService.StoreAnalysis(fileIndex, &analysisResult)
+		}
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(analysisResult)
+}
 
 func (h *Handler) Upload(w http.ResponseWriter, r *http.Request) {
 	// Parse multipart form (max 100MB)
@@ -234,7 +407,6 @@ func parseCSVFile(filePath string) (*state.DataFrame, error) {
 		FilePath: filePath,
 	}, nil
 }
-
 
 // ============================================================================
 // Status
@@ -526,7 +698,6 @@ func (h *Handler) GetColumnSimilarity(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-
 	totalRelationships := len(similarities)
 
 	// Limit to top 15 for display
@@ -547,15 +718,14 @@ func (h *Handler) GetColumnSimilarity(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-
 	// Calculate correlations for ALL numeric column pairs (not just name-matched)
 	type CorrelationItem struct {
-		File1Column        string  `json:"file1_column"`
-		File2Column        string  `json:"file2_column"`
-		PearsonCorrelation float64 `json:"pearson_correlation"`
+		File1Column         string  `json:"file1_column"`
+		File2Column         string  `json:"file2_column"`
+		PearsonCorrelation  float64 `json:"pearson_correlation"`
 		SpearmanCorrelation float64 `json:"spearman_correlation"`
-		Strength           string  `json:"strength"`
-		SampleSize         int     `json:"sample_size"`
+		Strength            string  `json:"strength"`
+		SampleSize          int     `json:"sample_size"`
 	}
 
 	correlations := []CorrelationItem{}
@@ -615,12 +785,12 @@ func (h *Handler) GetColumnSimilarity(w http.ResponseWriter, r *http.Request) {
 			}
 
 			correlations = append(correlations, CorrelationItem{
-				File1Column:        col1Name,
-				File2Column:        col2Name,
-				PearsonCorrelation: pearson,
+				File1Column:         col1Name,
+				File2Column:         col2Name,
+				PearsonCorrelation:  pearson,
 				SpearmanCorrelation: spearman,
-				Strength:           strength,
-				SampleSize:         minLen,
+				Strength:            strength,
+				SampleSize:          minLen,
 			})
 		}
 	}
@@ -635,7 +805,6 @@ func (h *Handler) GetColumnSimilarity(w http.ResponseWriter, r *http.Request) {
 		correlations = correlations[:20]
 	}
 
-
 	// Return response in Python backend format
 	resp := map[string]interface{}{
 		"nodes":               nodes,
@@ -648,7 +817,6 @@ func (h *Handler) GetColumnSimilarity(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(resp)
 }
-
 
 func getColumnIndex(headers []string, col string) int {
 	for i, h := range headers {
@@ -749,7 +917,6 @@ func estimateDataSimilarity(df1, df2 *state.DataFrame, col1Idx, col2Idx int) flo
 	return 0.0
 }
 
-
 // ============================================================================
 // Correlation
 // ============================================================================
@@ -845,15 +1012,15 @@ func (h *Handler) GetAllCorrelations(w http.ResponseWriter, r *http.Request) {
 	numericCols2 := df2.GetNumericColumnIndices()
 
 	type CorrelationItem struct {
-		File1Column        string  `json:"file1_column"`
-		File2Column        string  `json:"file2_column"`
-		Correlation        float64 `json:"correlation"`
-		PearsonCorrelation float64 `json:"pearson_correlation"`
+		File1Column         string  `json:"file1_column"`
+		File2Column         string  `json:"file2_column"`
+		Correlation         float64 `json:"correlation"`
+		PearsonCorrelation  float64 `json:"pearson_correlation"`
 		SpearmanCorrelation float64 `json:"spearman_correlation"`
-		Strength           string  `json:"strength"`
-		SampleSize         int     `json:"sample_size"`
-		File1Rows          int     `json:"file1_rows"`
-		File2Rows          int     `json:"file2_rows"`
+		Strength            string  `json:"strength"`
+		SampleSize          int     `json:"sample_size"`
+		File1Rows           int     `json:"file1_rows"`
+		File2Rows           int     `json:"file2_rows"`
 	}
 
 	correlations := []CorrelationItem{}
@@ -908,15 +1075,15 @@ func (h *Handler) GetAllCorrelations(w http.ResponseWriter, r *http.Request) {
 			// Only include if there's some correlation
 			if absCorr >= 0.1 {
 				correlations = append(correlations, CorrelationItem{
-					File1Column:        col1Name,
-					File2Column:        col2Name,
-					Correlation:        corr,
-					PearsonCorrelation: corr,
+					File1Column:         col1Name,
+					File2Column:         col2Name,
+					Correlation:         corr,
+					PearsonCorrelation:  corr,
 					SpearmanCorrelation: spearman,
-					Strength:           strength,
-					SampleSize:         minLen,
-					File1Rows:          len(df1.Rows),
-					File2Rows:          len(df2.Rows),
+					Strength:            strength,
+					SampleSize:          minLen,
+					File1Rows:           len(df1.Rows),
+					File2Rows:           len(df2.Rows),
 				})
 			}
 		}
@@ -1007,7 +1174,6 @@ func computeRanks(vals []float64) []float64 {
 	}
 	return ranks
 }
-
 
 func pearsonCorrelation(x, y []float64) float64 {
 	n := float64(len(x))
@@ -1130,13 +1296,13 @@ type QueryRequest struct {
 }
 
 type QueryResponse struct {
-	Answer      string                 `json:"answer"`
-	Explanation string                 `json:"explanation"`
-	RawResponse string                 `json:"raw_response,omitempty"`
-	Result      string                 `json:"result,omitempty"`
+	Answer      string                   `json:"answer"`
+	Explanation string                   `json:"explanation"`
+	RawResponse string                   `json:"raw_response,omitempty"`
+	Result      string                   `json:"result,omitempty"`
 	ResultData  []map[string]interface{} `json:"result_data,omitempty"`
-	ResultType  string                 `json:"result_type,omitempty"`
-	Error       string                 `json:"error,omitempty"`
+	ResultType  string                   `json:"result_type,omitempty"`
+	Error       string                   `json:"error,omitempty"`
 }
 
 func (h *Handler) Query(w http.ResponseWriter, r *http.Request) {
@@ -1346,7 +1512,7 @@ func (h *Handler) processMinQuery(df *state.DataFrame, question string) QueryRes
 
 func (h *Handler) processOverviewQuery(df *state.DataFrame) QueryResponse {
 	numericCols := df.GetNumericColumnIndices()
-	
+
 	summary := fmt.Sprintf("📊 Dataset Overview:\n• Rows: %d\n• Columns: %d\n• Column names: %s\n\n",
 		len(df.Rows), len(df.Headers), strings.Join(df.Headers, ", "))
 
@@ -1400,7 +1566,6 @@ func (h *Handler) processTopQuery(df *state.DataFrame, question string) QueryRes
 	}
 }
 
-
 // ============================================================================
 // Context Management
 // ============================================================================
@@ -1442,8 +1607,8 @@ func (h *Handler) GenerateContextQuestions(w http.ResponseWriter, r *http.Reques
 	resp := models.QuestionsResponse{
 		Success: true,
 		Questions: map[string][]models.Question{
-			"file1_questions":       questions1,
-			"file2_questions":       questions2,
+			"file1_questions":        questions1,
+			"file2_questions":        questions2,
 			"relationship_questions": relationshipQuestions,
 		},
 		TotalQuestions: len(questions1) + len(questions2) + len(relationshipQuestions),
@@ -1484,6 +1649,30 @@ func (h *Handler) analyzeDataFrame(df *state.DataFrame) models.DataAnalysisResul
 	}
 
 	return result
+}
+
+func (h *Handler) StoreContext(w http.ResponseWriter, r *http.Request) {
+	fileIndexStr := chi.URLParam(r, "fileIndex")
+	fileIndex, err := strconv.Atoi(fileIndexStr)
+	if err != nil {
+		http.Error(w, "Invalid file index", http.StatusBadRequest)
+		return
+	}
+
+	var ctx models.Context
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &ctx); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	if err := h.ContextService.StoreContext(fileIndex, &ctx); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "success"})
 }
 
 func (h *Handler) SubmitContext(w http.ResponseWriter, r *http.Request) {
@@ -1554,6 +1743,28 @@ func (h *Handler) GetContext(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(resp)
 }
 
+// GetQuestions endpoint (My V2 impl)
+func (h *Handler) GetQuestions(w http.ResponseWriter, r *http.Request) {
+	fileIndexStr := chi.URLParam(r, "fileIndex")
+	fileIndex, err := strconv.Atoi(fileIndexStr)
+	if err != nil {
+		http.Error(w, "Invalid file index", http.StatusBadRequest)
+		return
+	}
+
+	// Retrieve analysis from storage
+	analysis := h.ContextService.GetAnalysis(fileIndex)
+	if analysis == nil {
+		http.Error(w, "Analysis not found for this file. Please upload and analyze file first.", http.StatusNotFound)
+		return
+	}
+
+	questions := h.QuestionGenerator.GenerateQuestions(*analysis, fileIndex)
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(questions)
+}
+
 func (h *Handler) DeleteContext(w http.ResponseWriter, r *http.Request) {
 	fileIndexStr := chi.URLParam(r, "fileIndex")
 	fileIndex, err := strconv.Atoi(fileIndexStr)
@@ -1569,6 +1780,17 @@ func (h *Handler) DeleteContext(w http.ResponseWriter, r *http.Request) {
 		"success": true,
 		"message": fmt.Sprintf("Context cleared for File %d", fileIndex),
 	})
+}
+
+// GetSimilarityGraph generates the correlation graph (My V2 impl)
+func (h *Handler) GetSimilarityGraph(w http.ResponseWriter, r *http.Request) {
+	graph, err := h.SimilarityService.GenerateGraph(1, 2)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Error generating graph: %v", err), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(graph)
 }
 
 func (h *Handler) GetContextStatus(w http.ResponseWriter, r *http.Request) {
@@ -1669,7 +1891,7 @@ func (h *Handler) SubmitMatchFeedback(w http.ResponseWriter, r *http.Request) {
 	}
 
 	feedbackSystem := service.GetFeedbackSystem()
-	
+
 	entry := service.FeedbackEntry{
 		File1Column:    req.File1Column,
 		File2Column:    req.File2Column,
@@ -1705,6 +1927,36 @@ func (h *Handler) GetFeedbackStats(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(stats)
 }
 
+// ExportSQL generates SQL from the graph
+func (h *Handler) ExportSQL(w http.ResponseWriter, r *http.Request) {
+	var graph models.SimilarityGraph
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &graph); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	sql := h.ExportService.GenerateSQL(&graph)
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(sql))
+}
+
+// ExportPython generates Python script from the graph
+func (h *Handler) ExportPython(w http.ResponseWriter, r *http.Request) {
+	var graph models.SimilarityGraph
+	body, _ := io.ReadAll(r.Body)
+	if err := json.Unmarshal(body, &graph); err != nil {
+		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+		return
+	}
+
+	python := h.ExportService.GeneratePython(&graph)
+
+	w.Header().Set("Content-Type", "text/plain")
+	w.Write([]byte(python))
+}
+
 // ============================================================================
 // Helpers
 // ============================================================================
@@ -1720,4 +1972,3 @@ func getIntParam(r *http.Request, name string, defaultVal int) int {
 	}
 	return val
 }
-
