@@ -184,7 +184,68 @@ export default function Dashboard({ csvLoaded }: { csvLoaded: boolean }) {
     }
   }, [])
 
-  const exportMapper = useCallback(() => {
+  const exportToCSV = useCallback(() => {
+    if (!similarityGraph || !similarityGraph.similarities || similarityGraph.similarities.length === 0) {
+      showToast('warning', 'No correlation data available to export. Generate correlation first.')
+      return
+    }
+
+    try {
+      // CSV Header
+      const headers = [
+        'File 1 Column',
+        'File 2 Column',
+        'Confidence (%)',
+        'Similarity (%)',
+        'Type',
+        'Name Similarity (%)',
+        'Data Similarity (%)',
+        'Distribution Similarity (%)',
+        'LLM Semantic Score (%)',
+        'Pattern Score (%)',
+        'Reason'
+      ]
+
+      // CSV Rows
+      const rows = similarityGraph.similarities.map((sim: any) => [
+        sim.file1_column || '',
+        sim.file2_column || '',
+        (sim.confidence || 0).toFixed(2),
+        ((sim.similarity || 0) * 100).toFixed(2),
+        sim.type || '',
+        ((sim.name_similarity || 0) * 100).toFixed(2),
+        ((sim.data_similarity || 0) * 100).toFixed(2),
+        ((sim.distribution_similarity || 0) * 100).toFixed(2),
+        ((sim.llm_semantic_score || 0) * 100).toFixed(2),
+        ((sim.json_confidence || 0) * 100).toFixed(2),
+        (sim.reason || '').replace(/"/g, '""') // Escape quotes for CSV
+      ])
+
+      // Construct CSV content
+      const csvContent = [
+        headers.map(h => `"${h}"`).join(','),
+        ...rows.map(row => row.map(cell => `"${cell}"`).join(','))
+      ].join('\n')
+
+      // Create blob and download
+      const blob = new Blob([csvContent], { type: 'text/csv;charset=utf-8;' })
+      const url = URL.createObjectURL(blob)
+      const link = document.createElement('a')
+      link.href = url
+      link.download = `column-correlations-${new Date().toISOString().split('T')[0]}.csv`
+      document.body.appendChild(link)
+      link.click()
+      document.body.removeChild(link)
+      URL.revokeObjectURL(url)
+
+      showToast('success', '✅ CSV file exported successfully!')
+    } catch (error) {
+      console.error('Error exporting CSV:', error)
+      showToast('error', 'Failed to export CSV file. Please try again.')
+    }
+  }, [similarityGraph, showToast])
+
+  const exportToJSON = useCallback(() => {
     if (!similarityGraph || !similarityGraph.similarities || similarityGraph.similarities.length === 0) {
       showToast('warning', 'No correlation data available to export. Generate correlation first.')
       return
@@ -210,7 +271,8 @@ export default function Dashboard({ csvLoaded }: { csvLoaded: boolean }) {
             distribution_similarity: sim.distribution_similarity,
             llm_semantic_score: sim.llm_semantic_score,
             json_confidence: sim.json_confidence,
-          }
+          },
+          reason: sim.reason
         })),
         correlations: similarityGraph.correlations || []
       }
@@ -229,10 +291,10 @@ export default function Dashboard({ csvLoaded }: { csvLoaded: boolean }) {
       document.body.removeChild(link)
       URL.revokeObjectURL(url)
 
-      showToast('success', '✅ Mapper file exported successfully!')
+      showToast('success', '✅ JSON file exported successfully!')
     } catch (error) {
-      console.error('Error exporting mapper:', error)
-      showToast('error', 'Failed to export mapper file. Please try again.')
+      console.error('Error exporting JSON:', error)
+      showToast('error', 'Failed to export JSON file. Please try again.')
     }
   }, [similarityGraph, showToast])
 
@@ -459,15 +521,26 @@ export default function Dashboard({ csvLoaded }: { csvLoaded: boolean }) {
                 )}
               </Button>
               {similarityGraph && similarityGraph.similarities && similarityGraph.similarities.length > 0 && (
-                <Button
-                  onClick={exportMapper}
-                  variant="outline"
-                  size="sm"
-                  className="border-green-300 text-green-700 hover:bg-green-50"
-                >
-                  <Download className="h-3.5 w-3.5 mr-1.5" />
-                  Export Mapper
-                </Button>
+                <>
+                  <Button
+                    onClick={exportToCSV}
+                    variant="outline"
+                    size="sm"
+                    className="border-green-300 text-green-700 hover:bg-green-50"
+                  >
+                    <Download className="h-3.5 w-3.5 mr-1.5" />
+                    Export CSV
+                  </Button>
+                  <Button
+                    onClick={exportToJSON}
+                    variant="outline"
+                    size="sm"
+                    className="border-blue-300 text-blue-700 hover:bg-blue-50"
+                  >
+                    <Download className="h-3.5 w-3.5 mr-1.5" />
+                    Export JSON
+                  </Button>
+                </>
               )}
             </>
           )}
